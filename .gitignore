@@ -1,0 +1,17 @@
+*.iml
+*.aps
+*.hint
+**/.vs
+**/msvc/Debug*
+**/msvc/Release*
+**/msvc/bin*
+**/msvc/obj*
+**/msvc/*.db
+**/msvc/*.opendb
+**/msvc/*.sdf
+**/msvc/*.opensdf
+**/msvc/*.user
+**/msvc/*.suo
+**/msvc/*.db
+**/msvc/*.opendb
+**/msvc/ipch
