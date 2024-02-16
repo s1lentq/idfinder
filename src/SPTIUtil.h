@@ -63,6 +63,12 @@ namespace StrUtil {
 		return str.substr(first, (str.find_last_not_of(chars) - first + 1));
 	}
 
+	inline std::wstring trim(const std::wstring &str, const std::wstring chars = L" \n\r\t") {
+		size_t first = str.find_first_not_of(chars);
+		if (first == std::string::npos) return str;
+		return str.substr(first, (str.find_last_not_of(chars) - first + 1));
+	}
+
 	inline void change_byte_order(std::string &str) {
 		for (size_t i = 0; i < str.size(); i += 2) {
 			std::swap(str[i], str[i + 1]);

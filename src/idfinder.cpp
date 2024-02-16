@@ -37,6 +37,37 @@
 #pragma comment(lib, "wbemuuid.lib")
 #endif
 
+enum class DebugType
+{
+	Disable,
+	Enable
+};
+
+constexpr char endl = '\n';
+class Debug
+{
+public:
+	DebugType state;
+
+	Debug() :
+		state(DebugType::Disable) {}
+
+	Debug(DebugType st) :
+		state(st) {}
+
+	void operator=(DebugType st){
+		state = st;
+	}
+
+	template<typename T>
+	Debug &operator<< (T input)
+	{
+		if (this->state == DebugType::Enable)
+			std::wcout << input;
+		return *this;
+	}
+};
+
 enum class INTERFACE_TYPE
 {
 	UNKNOWN = 0,
@@ -114,6 +145,7 @@ public:
 	};
 
 	void init();
+	void setDebug(DebugType type);
 
 #if USE_DEBUG
 	void dump();
@@ -126,23 +158,34 @@ protected:
 	void				queryDevicesUsingIOCTL();
 	void				sortDisks();
 
-	bool				addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify);
-	bool				getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTERFACE_TYPE interfaceType);
+	enum class DISK_RESULT
+	{
+		OK = 0,
+		UNKNOWN,
+		BAD_SERIALNUMBER,
+		SERIALNUMBER_UNPRINTABLE,
+		MODEL_UNPRINTABLE,
+		FIRMWARE_UNPRINTABLE,
+		LIMIT_REACHED,
+	};
+
+	DISK_RESULT			addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify);
+	DISK_RESULT			getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTERFACE_TYPE interfaceType);
 
 	bool				containsNonPrintableChars(const char *str, std::size_t length) const;
 	bool				doIdentifyDevicePd(HANDLE hIoCtrl, std::size_t physicalDriveId, std::uint8_t target, IDENTIFY_DEVICE &data);
-	bool				doIdentifyDeviceNVMeStorageQuery(HANDLE hIoCtrl, IDENTIFY_DEVICE &data);
+	bool				doIdentifyDeviceNVMeStorageQuery(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data);
 
-	HANDLE				openPhysicalDrive(const std::wstring &path, bool &bElevatedPermissions);
+	HANDLE				openPhysicalDrive(const std::wstring &path, bool *pbElevatedPermissions = nullptr);
 
 	// NVMe SAMSUNG
-	bool				doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, IDENTIFY_DEVICE &data);
+	bool				doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data);
 	const std::wstring	getScsiPath(HANDLE hIoCtrl);
 
 	// NVMe Intel
-	bool				doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, IDENTIFY_DEVICE &data);
-	bool				doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, IDENTIFY_DEVICE &data);
-	bool				doIdentifyDeviceNVMeIntelRst(HANDLE hIoCtrl, IDENTIFY_DEVICE &data);
+	bool				doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data);
+	bool				doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data);
+	bool				doIdentifyDeviceNVMeIntelRst(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data);
 	bool				getScsiAddress(HANDLE hIoCtrl, std::uint8_t &ubPortNumber, std::uint8_t &ubPathId, std::uint8_t &ubTargetId, std::uint8_t &ubLun) const;
 
 	// OS methods
@@ -197,24 +240,40 @@ private:
 private:
 	std::vector<ATA_SMART_INFO> disks;
 	RTL_OSVERSIONINFOEXW osvi{};
+	Debug log;
 };
 
 void CIDFinder::init()
 {
 	checkOSVersion();
+
+	log
+		<< "  Windows "
+		<< osvi.dwMajorVersion << "."
+		<< osvi.dwMinorVersion << "."
+		<< osvi.dwBuildNumber  << "\n";
+
 #if USE_WMI
 	queryDevicesUsingWMI(); // if any chance WMI then use it
 #endif
 	queryDevicesUsingIOCTL();
 }
 
+void CIDFinder::setDebug(DebugType type)
+{
+	log = type;
+}
+
 #if USE_WMI
 void CIDFinder::queryDevicesUsingWMI()
 {
+	log << "  WMI [Info]          Initializing WMI Service" << endl << endl;
+
 	// Initialize COM
 	HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 	if (FAILED(hr)) {
 		CoUninitialize();
+		log << "  WMI [Error]: Unable to initialize COM library" << endl;
 		return; // Unable to initialize COM library
 	}
 
@@ -232,6 +291,7 @@ void CIDFinder::queryDevicesUsingWMI()
 
 	if (FAILED(hr)) {
 		CoUninitialize();
+		log << "  WMI [Error]: Failed to initialize security" << endl;
 		return; // Failed to initialize security
 	}
 
@@ -241,6 +301,7 @@ void CIDFinder::queryDevicesUsingWMI()
 		hr = pLoc.CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER);
 		if (FAILED(hr)) {
 			CoUninitialize();
+			log << "  WMI [Error]: Failed to create IWbemLocator object" << endl;
 			return; // Failed to create IWbemLocator object
 		}
 
@@ -282,6 +343,7 @@ void CIDFinder::queryDevicesUsingWMI()
 
 		if (FAILED(hr)) {
 			CoUninitialize();
+			log << "  WMI [Error]: Could not connect WMI service (" << (isWindows8OrGreater() ? 1 : 0) << ") " << endl;
 			return; // Could not connect WMI service
 		}
 
@@ -302,6 +364,7 @@ void CIDFinder::queryDevicesUsingWMI()
 
 		if (FAILED(hr)) {
 			CoUninitialize();
+			log << "  WMI [Error]: Could not set proxy blanket" << endl;
 			return; // Could not set proxy blanket
 		}
 
@@ -316,6 +379,7 @@ void CIDFinder::queryDevicesUsingWMI()
 
 		if (FAILED(hr)) {
 			CoUninitialize();
+			log << "  WMI [Error]: Query for physical disk information failed" << endl;
 			return; // Query for physical disk information failed
 		}
 
@@ -324,7 +388,7 @@ void CIDFinder::queryDevicesUsingWMI()
 		{
 			// Get the data from the above query
 			CComPtr<IWbemClassObject> pclsObj = NULL;
-			hr = pEnumerator->Next(5000, 1, &pclsObj, &uReturn);
+			hr = pEnumerator->Next(10000, 1, &pclsObj, &uReturn);
 			if (FAILED(hr) || uReturn == 0)
 				break;
 
@@ -335,6 +399,7 @@ void CIDFinder::queryDevicesUsingWMI()
 			_variant_t vtIndex{};
 			hr = pclsObj->Get(isWindows8OrGreater() ? L"Number" : L"Index", 0, &vtIndex, NULL, NULL);
 			if (FAILED(hr)) {
+				log << "  WMI [Warning]       Could not retrieve column '" << (isWindows8OrGreater() ? "Number" : "Index") << "'" << endl;
 				continue;
 			}
 
@@ -345,6 +410,7 @@ void CIDFinder::queryDevicesUsingWMI()
 				_variant_t vtBusType{};
 				hr = pclsObj->Get(L"BusType", 0, &vtBusType, NULL, NULL);
 				if (FAILED(hr)) {
+					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'BusType'" << endl;
 					continue;
 				}
 
@@ -354,12 +420,14 @@ void CIDFinder::queryDevicesUsingWMI()
 				case BusTypeSata: interfaceType = INTERFACE_TYPE::SATA; break;
 				case BusTypeAta:  interfaceType = INTERFACE_TYPE::PATA; break;
 				default:
+					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Undesirable interface '" << vtBusType.cVal << "' Skipping..." << endl;
 					continue; // bad interface
 				}
 
 				_variant_t vtBootFromDisk{};
 				hr = pclsObj->Get(L"BootFromDisk", 0, &vtBootFromDisk, NULL, NULL);
 				if (FAILED(hr)) {
+					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'BootFromDisk'" << endl;
 					continue;
 				}
 				BootFromDisk = vtBootFromDisk.boolVal != 0;
@@ -370,23 +438,27 @@ void CIDFinder::queryDevicesUsingWMI()
 				_variant_t vtPNPDeviceID{};
 				hr = pclsObj->Get(L"PNPDeviceID", 0, &vtPNPDeviceID, NULL, NULL);
 				if (FAILED(hr) || !vtPNPDeviceID.bstrVal) {
+					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'PNPDeviceID'" << endl;
 					continue;
 				}
 
 				if (wcsstr(vtPNPDeviceID.bstrVal, L"NVME")) {
 					interfaceType = INTERFACE_TYPE::NVME;
+					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Hard drive bus type 'NVME' detected by the 'PNPDeviceID' property (" << vtPNPDeviceID.bstrVal << ")" << endl;
 				}
 			}
 
 			_variant_t vtFirmwareVersion{};
 			hr = pclsObj->Get(isWindows8OrGreater() ? L"FirmwareVersion" : L"FirmwareRevision", 0, &vtFirmwareVersion, NULL, NULL);
 			if (FAILED(hr) || !vtFirmwareVersion.bstrVal) {
+				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column '" << (isWindows8OrGreater() ? "FirmwareVersion" : "FirmwareRevision") << "'" << endl;
 				continue;
 			}
 
 			_variant_t vtModel{};
 			hr = pclsObj->Get(L"Model", 0, &vtModel, NULL, NULL);
 			if (FAILED(hr) || !vtModel.bstrVal) {
+				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'Model'" << endl;
 				continue;
 			}
 
@@ -394,12 +466,14 @@ void CIDFinder::queryDevicesUsingWMI()
 
 			// Workaround for FuzeDrive (AMDStoreMi)
 			if (wModel.find(L"FuzeDrive") != std::string::npos || wModel.find(L"StoreMI") != std::string::npos) {
+				log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Undesirable model '" << wModel << "' Skipping..." << endl;
 				continue;
 			}
 
 			_variant_t vtSerialNumber{};
 			hr = pclsObj->Get(L"SerialNumber", 0, &vtSerialNumber, NULL, NULL);
 			if (FAILED(hr) || !vtSerialNumber.bstrVal) {
+				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'SerialNumber'" << endl;
 				continue;
 			}
 
@@ -434,7 +508,30 @@ void CIDFinder::queryDevicesUsingWMI()
 				woffs += 20 + 1;
 			}
 
-			if (addDisk(vtIndex.uintVal, interfaceType, COMMAND_TYPE::PHYSICAL_DRIVE, DEVICE_DATA_SOURCE::WMI, identify) && isWindows8OrGreater()) {
+			DISK_RESULT eResult = addDisk(vtIndex.uintVal, interfaceType, COMMAND_TYPE::PHYSICAL_DRIVE, DEVICE_DATA_SOURCE::WMI, identify);
+
+			log << "  WMI [Disk" << vtIndex.uintVal << "]         Model        " << vtModel.bstrVal                                << endl;
+			log << "  WMI [Disk" << vtIndex.uintVal << "]         Firmware     " << vtFirmwareVersion.bstrVal                      << endl;
+			log << "  WMI [Disk" << vtIndex.uintVal << "]         SerialNumber " << StrUtil::trim(vtSerialNumber.bstrVal)          << endl;
+			log << "  WMI [Disk" << vtIndex.uintVal << "]         BusType      " << static_cast<int>(interfaceType)                << endl;
+			log << "  WMI [Disk" << vtIndex.uintVal << "]         Result       " << (eResult == DISK_RESULT::OK ? "Ok" : "Failed");
+
+			switch (eResult)
+			{
+			case DISK_RESULT::OK:
+				break;
+			default:
+			case DISK_RESULT::UNKNOWN:                  log << L" (Unknown)";                   break;
+			case DISK_RESULT::BAD_SERIALNUMBER:         log << L" (Bad serial number)";         break;
+			case DISK_RESULT::SERIALNUMBER_UNPRINTABLE: log << L" (Unprintable serial number)"; break;
+			case DISK_RESULT::MODEL_UNPRINTABLE:        log << L" (Unprintable model)";         break;
+			case DISK_RESULT::FIRMWARE_UNPRINTABLE:     log << L" (Unprintable firmware)";      break;
+			case DISK_RESULT::LIMIT_REACHED:            log << L" (Limit reached)";             break;
+			}
+
+			log << endl << endl;
+
+			if (eResult == DISK_RESULT::OK && isWindows8OrGreater()) {
 				ATA_SMART_INFO &asi = disks.back();
 				asi.BootFromDisk = BootFromDisk;
 			}
@@ -463,20 +560,28 @@ void CIDFinder::queryDevicesUsingIOCTL()
 	{
 		bool bElevatedPermissions = true;
 		std::wstring strDevice = L"\\\\.\\PhysicalDrive" + std::to_wstring(i);
-		HANDLE hDevice = openPhysicalDrive(strDevice.c_str(), bElevatedPermissions);
+		HANDLE hDevice = openPhysicalDrive(strDevice.c_str(), &bElevatedPermissions);
 		if (!HANDLE_SUCCESS(hDevice))
+		{
+			if (GetLastError() == ERROR_ACCESS_DENIED) {
+				log << "IOCTL [Info/Disk" << i << "]    No access" << endl;
+			}
+
 			continue;
+		}
 
 		DISK_GEOMETRY dg{};
 		DWORD dwBytesReturned = 0;
-		if (!DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &dg, sizeof(DISK_GEOMETRY), &dwBytesReturned, NULL)) {
+		if (!DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &dg, sizeof(DISK_GEOMETRY), &dwBytesReturned, NULL) || dwBytesReturned != sizeof(DISK_GEOMETRY)) {
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Could not get disk geometry" << endl;
 			continue;
 		}
 
 		// only fixed media are scanned
-		if (dwBytesReturned != sizeof(DISK_GEOMETRY) || dg.MediaType != FixedMedia) {
+		if (dg.MediaType != FixedMedia) {
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Undesirable media type '" << dg.MediaType << "' Skipping..." << endl;
 			continue;
 		}
 
@@ -493,6 +598,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 			&dwBytesReturned, NULL))
 		{
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Could not get requested buffer size for storage descriptor" << endl;
 			continue;
 		}
 
@@ -500,6 +606,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		if (!storageDescriptorHeader.Size)
 		{
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Bad requested buffer size for storage descriptor" << endl;
 			continue;
 		}
 
@@ -509,21 +616,24 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		ZeroMemory(outBuffer.get(), dwOutBufferSize);
 
 		if (!DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY, &storagePropertyQuery,
-			sizeof(STORAGE_PROPERTY_QUERY), outBuffer.get(), dwOutBufferSize, &dwBytesReturned, NULL))
+			sizeof(STORAGE_PROPERTY_QUERY), outBuffer.get(), dwOutBufferSize,
+			&dwBytesReturned, NULL))
 		{
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Could not get properties for storage descriptor" << endl;
 			continue;
 		}
 
 		INTERFACE_TYPE interfaceType = INTERFACE_TYPE::UNKNOWN;
 
-		STORAGE_DEVICE_DESCRIPTOR *pDescriptor = (STORAGE_DEVICE_DESCRIPTOR *)outBuffer.get();
+		const STORAGE_DEVICE_DESCRIPTOR *pDescriptor = (STORAGE_DEVICE_DESCRIPTOR *)outBuffer.get();
 		switch (pDescriptor->BusType) {
 		case BusTypeNvme: interfaceType = INTERFACE_TYPE::NVME; break;
 		case BusTypeSata: interfaceType = INTERFACE_TYPE::SATA; break;
-		case BusTypeAta:  interfaceType = INTERFACE_TYPE::PATA;  break;
+		case BusTypeAta:  interfaceType = INTERFACE_TYPE::PATA; break;
 		default: {
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Undesirable interface '" << pDescriptor->BusType << "' Skipping..." << endl;
 			continue;
 		}
 		}
@@ -536,10 +646,12 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		// Workaround for FuzeDrive (AMDStoreMi)
 		if (model.find("FuzeDrive") != std::string::npos || model.find("StoreMI") != std::string::npos) {
 			CloseHandle(hDevice);
+			log << "IOCTL [Info/Disk" << i << "]    Undesirable model '" << StrUtil::s2ws(model) << "' Skipping..." << endl;
 			continue;
 		}
 
-		if (getDeviceData(hDevice, i, interfaceType))
+		DISK_RESULT eResult = getDeviceData(hDevice, i, interfaceType);
+		if (eResult == DISK_RESULT::OK)
 		{
 			ATA_SMART_INFO &asi = disks.back();
 			if (   asi.Model.find("DW C") != std::string::npos // WDC
@@ -564,7 +676,8 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		else if (!bElevatedPermissions)
 		{
 			IDENTIFY_DEVICE identify{};
-			switch (interfaceType) {
+			switch (interfaceType)
+			{
 			case INTERFACE_TYPE::NVME: // nevermind, nvme serialNumber is not correct from storage device descriptor, just skip it
 //				memcpy_s(&identify, sizeof(NVME_IDENTIFY_DEVICE), outBuffer.get(), sizeof(NVME_IDENTIFY_DEVICE));
 //				AddDisk(i, interfaceType, COMMAND_TYPE::NVME_STORAGE_QUERY, DEVICE_DATA_SOURCE::STORAGE_DESCRIPTOR, identify);
@@ -599,9 +712,8 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		path += c;
 		path += L":";
 
-		HANDLE hHandle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-			FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (!hHandle || hHandle == INVALID_HANDLE_VALUE)
+		HANDLE hHandle = openPhysicalDrive(path.c_str());
+		if (!HANDLE_SUCCESS(hHandle))
 			continue;
 
 		VOLUME_DISK_EXTENTS_LX volumeDiskExtents{};
@@ -612,9 +724,12 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		if (!bResult)
 			continue;
 
-		for (DWORD n = 0; n < volumeDiskExtents.NumberOfDiskExtents && volumeDiskExtents.NumberOfDiskExtents < 4; ++n)
+		for (DWORD n = 0; n < volumeDiskExtents.NumberOfDiskExtents; n++)
 		{
-			PDISK_EXTENT pDiskExtent = &volumeDiskExtents.Extents[n];
+			if (n >= volumeDiskExtents.NumberOfDiskExtents)
+				break;
+
+			const PDISK_EXTENT pDiskExtent = &volumeDiskExtents.Extents[n];
 			if (pDiskExtent->ExtentLength.QuadPart == 0)
 				continue;
 
@@ -659,6 +774,7 @@ void CIDFinder::sortDisks()
 		if (!a.BootFromDisk && b.BootFromDisk)
 			return false;
 
+#if USE_DEBUG
 		int dlm1 = -1;
 		int dlm2 = -1;
 
@@ -691,29 +807,37 @@ void CIDFinder::sortDisks()
 		int sort1 = (dlm1 << 8) + pdi1;
 		int sort2 = (dlm2 << 8) + pdi2;
 		return sort1 < sort2;
+#else
+		return a.PhysicalDriveId < b.PhysicalDriveId;
+#endif
 	});
 }
 
-HANDLE CIDFinder::openPhysicalDrive(const std::wstring &path, bool &bElevatedPermissions)
+HANDLE CIDFinder::openPhysicalDrive(const std::wstring &path, bool *pbElevatedPermissions)
 {
+	bool bElevatedPermissions = true;
+
 	// try open with elevated permissions
 	HANDLE hIoCtrl = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, // NOTE: requeriment elevated permissions
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 
-	bElevatedPermissions = true;
-
-	// try open again but without permissions
+#if 1
 	if (!HANDLE_SUCCESS(hIoCtrl))
 	{
+		// try open again but without permissions
+		bElevatedPermissions = false;
 		hIoCtrl = CreateFileW(path.c_str(), 0,
 			FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-		bElevatedPermissions = false;
 	}
+#endif
+
+	if (pbElevatedPermissions)
+		*pbElevatedPermissions = bElevatedPermissions;
 
 	return hIoCtrl;
 }
 
-bool CIDFinder::getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTERFACE_TYPE interfaceType)
+CIDFinder::DISK_RESULT CIDFinder::getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTERFACE_TYPE interfaceType)
 {
 	IDENTIFY_DEVICE identify{};
 	COMMAND_TYPE command = COMMAND_TYPE::UNKNOWN;
@@ -734,15 +858,15 @@ bool CIDFinder::getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTER
 	}
 	case INTERFACE_TYPE::NVME:
 	{
-		if (isWindows10OrGreater() && doIdentifyDeviceNVMeStorageQuery(hIoCtrl, identify))
+		if (isWindows10OrGreater() && doIdentifyDeviceNVMeStorageQuery(hIoCtrl, physicalDriveId, identify))
 			command = COMMAND_TYPE::NVME_STORAGE_QUERY;
-		else if (doIdentifyDeviceNVMeIntelVroc(hIoCtrl, identify))
+		else if (doIdentifyDeviceNVMeIntelVroc(hIoCtrl, physicalDriveId, identify))
 			command = COMMAND_TYPE::NVME_INTEL_VROC;
-		else if (doIdentifyDeviceNVMeIntelRst(hIoCtrl, identify))
+		else if (doIdentifyDeviceNVMeIntelRst(hIoCtrl, physicalDriveId, identify))
 			command = COMMAND_TYPE::NVME_INTEL_RST;
-		else if (doIdentifyDeviceNVMeSamsung(hIoCtrl, identify))
+		else if (doIdentifyDeviceNVMeSamsung(hIoCtrl, physicalDriveId, identify))
 			command = COMMAND_TYPE::NVME_SAMSUNG;
-		else if (doIdentifyDeviceNVMeIntel(hIoCtrl, identify))
+		else if (doIdentifyDeviceNVMeIntel(hIoCtrl, physicalDriveId, identify))
 			command = COMMAND_TYPE::NVME_INTEL;
 		break;
 	}
@@ -769,10 +893,16 @@ bool CIDFinder::doIdentifyDevicePd(HANDLE hIoCtrl, std::size_t physicalDriveId, 
 		&sendCmd, sizeof(SENDCMDINPARAMS),
 		&sendCmdOutParam, sizeof(IDENTIFY_DEVICE_OUTDATA),
 		&dwBytesReturned, NULL))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/PD/" << target << "]  Could not receive driver data (No permissions?)" << endl;
 		return false;
+	}
 
 	if (dwBytesReturned != sizeof(IDENTIFY_DEVICE_OUTDATA))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/PD/" << target << "]  Bad receive driver data" << endl;
 		return false;
+	}
 
 	memcpy_s(&data, sizeof(ATA_IDENTIFY_DEVICE), sendCmdOutParam.SendCmdOutParam.bBuffer, sizeof(ATA_IDENTIFY_DEVICE));
 	return true;
@@ -781,7 +911,7 @@ bool CIDFinder::doIdentifyDevicePd(HANDLE hIoCtrl, std::size_t physicalDriveId, 
 //
 //  NVMe SAMSUNG
 //
-bool CIDFinder::doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
+bool CIDFinder::doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data)
 {
 	ZeroMemory(&data, sizeof(data));
 
@@ -814,7 +944,10 @@ bool CIDFinder::doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, IDENTIFY_DEVICE &dat
 	DWORD length = offsetof(SCSI_PASS_THROUGH_WITH_BUFFERS24, DataBuf) + sptwb.Spt.DataTransferLength;
 	if (!DeviceIoControl(hIoCtrl, IOCTL_SCSI_PASS_THROUGH,
 		&sptwb, length, &sptwb, length, &dwBytesReturned, NULL))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeSamsung]    Could not pass through identify NVME 'OUT' command" << endl;
 		return false;
+	}
 
 	sptwb.Spt.CdbLength = 16;
 	sptwb.Spt.Cdb[0]    = 0xA2; // SECURITY PROTOCOL IN
@@ -832,14 +965,20 @@ bool CIDFinder::doIdentifyDeviceNVMeSamsung(HANDLE hIoCtrl, IDENTIFY_DEVICE &dat
 
 	if (!DeviceIoControl(hIoCtrl, IOCTL_SCSI_PASS_THROUGH,
 		&sptwb, length, &sptwb, length, &dwBytesReturned, NULL))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeSamsung]    Could not pass through identify NVME 'IN' command" << endl;
 		return false;
+	}
 
 	std::size_t count = 0;
 	for (int i = 0; i < 512; i++)
 		count += sptwb.DataBuf[i];
 
 	if (count == 0)
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeSamsung]    Malformed data" << endl;
 		return false;
+	}
 
 	memcpy_s(&data, sizeof(NVME_IDENTIFY_DEVICE), sptwb.DataBuf, sizeof(NVME_IDENTIFY_DEVICE));
 	return true;
@@ -860,18 +999,23 @@ const std::wstring CIDFinder::getScsiPath(HANDLE hIoCtrl)
 	return std::wstring{};
 }
 
-bool CIDFinder::doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
+bool CIDFinder::doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data)
 {
 	ZeroMemory(&data, sizeof(data));
 
 	std::wstring strScsiDrive = getScsiPath(hIoCtrl);
-	if (strScsiDrive.empty())
+	if (strScsiDrive.empty()) {
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntel]    Could not get SCSI address" << endl;
 		return false;
+	}
 
 	HANDLE hIoScsiCtrl = CreateFileW(strScsiDrive.c_str(), GENERIC_READ | GENERIC_WRITE, // TODO: REQUERIMENT ADMIN RIGHTS
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (!HANDLE_SUCCESS(hIoScsiCtrl))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntel]    Could not open physical drive  Error: " << GetLastError() << endl;
 		return false;
+	}
 
 	NVME_PASS_THROUGH_IOCTL nptwb{};
 	DWORD length = sizeof(nptwb);
@@ -894,6 +1038,7 @@ bool CIDFinder::doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
 		&nptwb, length, &nptwb, length, &dwBytesReturned, NULL))
 	{
 		CloseHandle(hIoScsiCtrl);
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntel]    Could not pass through identify NVME command" << endl;
 		return false;
 	}
 
@@ -904,6 +1049,7 @@ bool CIDFinder::doIdentifyDeviceNVMeIntel(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
 	if (count == 0)
 	{
 		CloseHandle(hIoScsiCtrl);
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntel]    Malformed data" << endl;
 		return false;
 	}
 
@@ -938,65 +1084,75 @@ bool CIDFinder::getScsiAddress(
 	return true;
 }
 
-bool CIDFinder::doIdentifyDeviceNVMeIntelRst(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
+bool CIDFinder::doIdentifyDeviceNVMeIntelRst(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data)
 {
 	std::uint8_t portNumber = 0, pathId = 0, targetId = 0, lun = 0;
-	if (!getScsiAddress(hIoCtrl, portNumber, pathId, targetId, lun))
+	if (!getScsiAddress(hIoCtrl, portNumber, pathId, targetId, lun)) {
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelRst]    Could not get SCSI port address" << endl;
 		return false;
+	}
 
 	std::wstring strScsiDrive = L"\\\\.\\Scsi%d:" + std::to_wstring(portNumber);
 	HANDLE hIoScsiCtrl = CreateFileW(strScsiDrive.c_str(), GENERIC_READ | GENERIC_WRITE, // TODO: REQUERIMENT ADMIN RIGHTS
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-	if (!HANDLE_SUCCESS(hIoScsiCtrl))
+	if (!HANDLE_SUCCESS(hIoScsiCtrl)) {
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelRst]    Could not open physical drive  Error: " << GetLastError() << endl;
 		return false;
+	}
 
 	INTEL_NVME_PASS_THROUGH NVMeData;
 	memset(&NVMeData, 0, sizeof(NVMeData));
 
 	NVMeData.SRB.HeaderLength = sizeof(SRB_IO_CONTROL);
 	memcpy(NVMeData.SRB.Signature, "IntelNvm", 8);
-	NVMeData.SRB.Timeout = 10;
+	NVMeData.SRB.Timeout     = 10;
 	NVMeData.SRB.ControlCode = IOCTL_INTEL_NVME_PASS_THROUGH;
-	NVMeData.SRB.Length = sizeof(INTEL_NVME_PASS_THROUGH) - sizeof(SRB_IO_CONTROL);
+	NVMeData.SRB.Length      = sizeof(INTEL_NVME_PASS_THROUGH) - sizeof(SRB_IO_CONTROL);
 
-	NVMeData.Payload.Version = 1;
-	NVMeData.Payload.PathId = pathId;
-	NVMeData.Payload.Cmd.CDW0.Opcode = 0x06; // ADMIN_IDENTIFY
-	NVMeData.Payload.Cmd.NSID = 0;
+	NVMeData.Payload.Version                  = 1;
+	NVMeData.Payload.PathId                   = pathId;
+	NVMeData.Payload.Cmd.CDW0.Opcode          = 0x06; // ADMIN_IDENTIFY
+	NVMeData.Payload.Cmd.NSID                 = 0;
 	NVMeData.Payload.Cmd.u.IDENTIFY.CDW10.CNS = 1;
-	NVMeData.Payload.ParamBufLen = sizeof(INTEL_NVME_PAYLOAD) + sizeof(SRB_IO_CONTROL); //0xA4;
-	NVMeData.Payload.ReturnBufferLen = 0x1000;
-	NVMeData.Payload.CplEntry[0] = 0;
+	NVMeData.Payload.ParamBufLen              = sizeof(INTEL_NVME_PAYLOAD) + sizeof(SRB_IO_CONTROL);
+	NVMeData.Payload.ReturnBufferLen          = 0x1000;
+	NVMeData.Payload.CplEntry[0]              = 0;
 
 	DWORD dwBytesReturned = 0;
 	if (!DeviceIoControl(hIoScsiCtrl, IOCTL_SCSI_MINIPORT,
 		&NVMeData, sizeof(NVMeData), &NVMeData, sizeof(NVMeData), &dwBytesReturned, NULL))
 	{
 		CloseHandle(hIoScsiCtrl);
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelRst]    Could not pass through identify NVME command" << endl;
 		return false;
 	}
 
 	memcpy_s(&data, sizeof(NVME_IDENTIFY_DEVICE), NVMeData.DataBuffer, sizeof(NVME_IDENTIFY_DEVICE));
 	CloseHandle(hIoScsiCtrl);
-	return TRUE;
+	return true;
 }
 
 //
 // NVMe Intel VROC
 //
-bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
+bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data)
 {
 	ZeroMemory(&data, sizeof(data));
 
 	std::uint8_t portNumber = 0, pathId = 0, targetId = 0, lun = 0;
-	if (!getScsiAddress(hIoCtrl, portNumber, pathId, targetId, lun))
+	if (!getScsiAddress(hIoCtrl, portNumber, pathId, targetId, lun)) {
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelVroc]    Could not get SCSI port address" << endl;
 		return false;
+	}
 
 	std::wstring strScsiDrive = L"\\\\.\\Scsi%d:" + std::to_wstring(portNumber);
 	HANDLE hIoScsiCtrl = CreateFileW(strScsiDrive.c_str(), GENERIC_READ | GENERIC_WRITE, // TODO: REQUERIMENT ADMIN RIGHTS
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (!HANDLE_SUCCESS(hIoScsiCtrl))
+	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelVroc]    Could not open physical drive  Error: " << GetLastError() << endl;
 		return false;
+	}
 
 	NVME_PASS_THROUGH_IOCTL nptwb{};
 	DWORD length = sizeof(nptwb);
@@ -1023,6 +1179,7 @@ bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, IDENTIFY_DEVICE &d
 		&nptwb, length, &nptwb, length, &dwBytesReturned, NULL))
 	{
 		CloseHandle(hIoScsiCtrl);
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelVroc]    Could not pass through identify NVME command" << endl;
 		return false;
 	}
 
@@ -1032,6 +1189,7 @@ bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, IDENTIFY_DEVICE &d
 
 	if (count == 0) {
 		CloseHandle(hIoScsiCtrl);
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeIntelVroc]    Malformed data" << endl;
 		return false;
 	}
 
@@ -1042,7 +1200,7 @@ bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, IDENTIFY_DEVICE &d
 
 // NVMe Storage Query
 // Reference: http://web.archive.org/web/20160604013727/http://http://naraeon.net/en/archives/1338
-bool CIDFinder::doIdentifyDeviceNVMeStorageQuery(HANDLE hIoCtrl, IDENTIFY_DEVICE &data)
+bool CIDFinder::doIdentifyDeviceNVMeStorageQuery(HANDLE hIoCtrl, std::size_t physicalDriveId, IDENTIFY_DEVICE &data)
 {
 	StorageQuery::TStorageQueryWithBuffer nptwb{};
 	nptwb.ProtocolSpecific.ProtocolType                = StorageQuery::ProtocolTypeNvme;
@@ -1058,6 +1216,7 @@ bool CIDFinder::doIdentifyDeviceNVMeStorageQuery(HANDLE hIoCtrl, IDENTIFY_DEVICE
 	if (!DeviceIoControl(hIoCtrl, IOCTL_STORAGE_QUERY_PROPERTY,
 		&nptwb, sizeof(nptwb), &nptwb, sizeof(nptwb), &dwBytesReturned, NULL))
 	{
+		log << "IOCTL [Disk" << physicalDriveId << "/NVMeStorageQuery]    Could not receive driver data (No permissions?)" << endl;
 		return false;
 	}
 
@@ -1148,10 +1307,21 @@ bool CIDFinder::copyDeviceInfo(ATA_SMART_INFO &asi, const T &deviceInfo)
 	return true;
 }
 
-bool CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify)
+enum class BADDISK_REASON
+{
+	OK = 0,
+	UKNOWN,
+	SERIALNUMBER,
+	SERIALNUMBER_UNPRINTABLE,
+	MODEL_UNPRINTABLE,
+	FIRMWARE_UNPRINTABLE,
+	LIMIT_REACHED,
+};
+
+CIDFinder::DISK_RESULT CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify)
 {
 	if (command == COMMAND_TYPE::UNKNOWN)
-		return false;
+		return DISK_RESULT::UNKNOWN;
 
 	ATA_SMART_INFO asi{};
 	asi.IdentifyDevice      = identify;
@@ -1163,8 +1333,9 @@ bool CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceTyp
 
 	if (source == DEVICE_DATA_SOURCE::STORAGE_DESCRIPTOR || source == DEVICE_DATA_SOURCE::WMI)
 	{
-		if (!copyDeviceInfoFromStorage(asi, (STORAGE_DEVICE_DESCRIPTOR *)&identify.BIN))
-			return false; // bad storage device data
+		if (!copyDeviceInfoFromStorage(asi, (STORAGE_DEVICE_DESCRIPTOR *)&identify.BIN)) {
+			return DISK_RESULT::BAD_SERIALNUMBER; // bad storage device data
+		}
 	}
 	else if (interfaceType == INTERFACE_TYPE::NVME)
 	{
@@ -1172,12 +1343,12 @@ bool CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceTyp
 	}
 	else if (interfaceType == INTERFACE_TYPE::PATA || interfaceType == INTERFACE_TYPE::SATA)
 	{
-		if (containsNonPrintableChars(identify.ATA.SerialNumber, sizeof(identify.ATA.SerialNumber)) ||
-			containsNonPrintableChars(identify.ATA.FirmwareRev, sizeof(identify.ATA.FirmwareRev)) ||
-			containsNonPrintableChars(identify.ATA.Model, sizeof(identify.ATA.Model))) {
-			return false;
-		}
-
+		if (containsNonPrintableChars(identify.ATA.SerialNumber, sizeof(identify.ATA.SerialNumber)))
+			return DISK_RESULT::SERIALNUMBER_UNPRINTABLE;
+		if (containsNonPrintableChars(identify.ATA.FirmwareRev, sizeof(identify.ATA.FirmwareRev)))
+			return DISK_RESULT::FIRMWARE_UNPRINTABLE;
+		if (containsNonPrintableChars(identify.ATA.Model, sizeof(identify.ATA.Model)))
+			return DISK_RESULT::MODEL_UNPRINTABLE;
 		copyDeviceInfo(asi, identify.ATA); // SATA, PATA have the same set of structure info
 	}
 
@@ -1193,7 +1364,8 @@ bool CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceTyp
 		return info.PhysicalDriveId == physicalDriveId;
 	});
 
-	if (it != disks.end()) {
+	if (it != disks.end())
+	{
 		// update device info
 		ATA_SMART_INFO &device = (*it);
 		device.IdentifyDevice  = asi.IdentifyDevice;
@@ -1208,13 +1380,16 @@ bool CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceTyp
 		device.FirmwareRev     = asi.FirmwareRev;
 		if (!device.BootFromDisk)
 			device.BootFromDisk = asi.BootFromDisk;
-	} else {
+	}
+	else
+	{
 		if (disks.size() >= MAX_DISK)
-			return false;
+			return DISK_RESULT::LIMIT_REACHED;
+
 		disks.emplace_back(asi);
 	}
 
-	return true;
+	return DISK_RESULT::OK;
 }
 
 std::size_t CIDFinder::getSystemBootDriveNumber()
@@ -1248,16 +1423,19 @@ std::size_t CIDFinder::getSystemBootDriveNumber()
 
 std::string CIDFinder::getSerialNumber() const
 {
-	for (const ATA_SMART_INFO &asi : disks)
-	{
+	for (const ATA_SMART_INFO &asi : disks) {
 		if (asi.SerialNumber.empty()) continue;
+		std::cout << "      [Info/Disk" << asi.PhysicalDriveId << "]          Preferred SerialNumber is selected '" << asi.SerialNumber << "'" << endl;
 		return asi.SerialNumber;
 	}
 
 	DWORD dwVolumeSerialNumber = 0;
-	if (!GetVolumeInformationA(NULL, NULL, 0, &dwVolumeSerialNumber, NULL, NULL, NULL, 0))
+	if (!GetVolumeInformationA(NULL, NULL, 0, &dwVolumeSerialNumber, NULL, NULL, NULL, 0)) {
+		std::cout << "      [Info]          Could not retrive volume SerialNumber '" << GetLastError() << "'" << endl;
 		return std::string{};
+	}
 
+	std::cout << "      [Info]          Fallback SerialNumber as volumeid '" << dwVolumeSerialNumber << "'" << endl;
 	return std::to_string(dwVolumeSerialNumber);
 }
 
@@ -1295,45 +1473,56 @@ namespace idfinder {
 #if USE_DEBUG
 void CIDFinder::dump()
 {
+	std::cout << endl;
+
 	for (const ATA_SMART_INFO &asi : disks)
 	{
 		if (asi.PhysicalDriveId < 0)
 			continue;
 
-        std::cout << "\t\\\\.\\PhysicalDrive" << asi.PhysicalDriveId << std::endl;
+		std::cout << "\t\\\\.\\PhysicalDrive" << asi.PhysicalDriveId << endl;
 
-        std::string interfaceTypeStr;
-        if (asi.InterfaceType == INTERFACE_TYPE::PATA)
-            interfaceTypeStr = "PATA ";
-        else if (asi.InterfaceType == INTERFACE_TYPE::SATA)
-            interfaceTypeStr = "SATA ";
-        else if (asi.InterfaceType == INTERFACE_TYPE::NVME)
-            interfaceTypeStr = "NVME ";
-        else
-            interfaceTypeStr = "UNKNOWN ";
+		std::string interfaceTypeStr;
+		if (asi.InterfaceType == INTERFACE_TYPE::PATA)
+			interfaceTypeStr = "PATA ";
+		else if (asi.InterfaceType == INTERFACE_TYPE::SATA)
+			interfaceTypeStr = "SATA ";
+		else if (asi.InterfaceType == INTERFACE_TYPE::NVME)
+			interfaceTypeStr = "NVME ";
+		else
+			interfaceTypeStr = "UNKNOWN ";
 
-        std::cout << "\t" << interfaceTypeStr << asi.DriveMap << (asi.BootFromDisk ? " System" : "") << std::endl;
-        std::cout << "\tModel          " << asi.Model << std::endl;
-        std::cout << "\tFirmware       " << asi.FirmwareRev << std::endl;
-        std::cout << "\tSerialNumber   " << asi.SerialNumber << std::endl;
-        std::cout << "\tCommandType    " << commandTypeString[static_cast<int>(asi.CommandType)] << std::endl;
-        std::cout << "\tDataSource     " << dataSourceTypeString[static_cast<int>(asi.DataSource)] << std::endl;
-        std::cout << "------------------------------------------------------" << std::endl << std::endl;
+		std::cout << "\t" << interfaceTypeStr << asi.DriveMap << (asi.BootFromDisk ? " System" : "") << endl;
+		std::cout << "\tModel          " << asi.Model << endl;
+		std::cout << "\tFirmware       " << asi.FirmwareRev << endl;
+		std::cout << "\tSerialNumber   " << asi.SerialNumber << endl;
+		std::cout << "\tCommandType    " << commandTypeString[static_cast<int>(asi.CommandType)] << endl;
+		std::cout << "\tDataSource     " << dataSourceTypeString[static_cast<int>(asi.DataSource)] << endl;
+		std::cout << "------------------------------------------------------" << endl << endl;
 	}
 }
 #endif
 
 int main(int argc, char *argv[])
 {
-	CIDFinder &drive = CIDFinder::get();
+	DebugType dbgopt = DebugType::Disable;
+	for (int i = 1; i < argc; i++)
+	{
+		if (std::string(argv[i]) == "--debug" || std::string(argv[i]) == "-d") {
+			dbgopt = DebugType::Enable;
+			break;
+		}
+	}
 
+	CIDFinder &drive = CIDFinder::get();
+	drive.setDebug(dbgopt);
 	drive.init();
 
 #if USE_DEBUG
 	drive.dump();
 #endif
 
-	std::cout << "\tSerialNumber   " << drive.getSerialNumber() << std::endl;
+	std::cout << "\tSerialNumber   " << drive.getSerialNumber() << endl;
 	system("pause");
 
 	return 0;
