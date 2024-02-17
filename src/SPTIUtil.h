@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <cctype>
+#include <algorithm>
 
 // From Driver Development Kit
 
@@ -73,6 +75,24 @@ namespace StrUtil {
 		for (size_t i = 0; i < str.size(); i += 2) {
 			std::swap(str[i], str[i + 1]);
 		}
+	}
+
+	// case-insensitive substring search
+	template <typename T>
+	inline typename T::size_type find(T const &a, T const &b) {
+		T::const_iterator f = std::search(a.begin(), a.end(), b.begin(), b.end(), [](typename T::value_type const &cA, typename T::value_type const &cB){
+			return std::tolower(cA) == std::tolower(cB);
+		});
+		return (f == a.end()) ? std::wstring::npos : std::distance(a.begin(), f);
+	}
+
+	template <typename T>
+	inline typename T::size_type find(T const &a, typename T::value_type const *b) {
+		T::const_iterator f = std::search(a.begin(), a.end(), b, b + std::char_traits<typename T::value_type>::length(b), [](typename T::value_type const &cA, typename T::value_type const &cB){
+			return std::tolower(cA) == std::tolower(cB);
+		});
+
+		return (f == a.end()) ? std::wstring::npos : std::distance(a.begin(), f);
 	}
 
 	std::string ws2s(const std::wstring &in) {

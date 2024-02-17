@@ -162,6 +162,7 @@ protected:
 	{
 		OK = 0,
 		UNKNOWN,
+		ACCESS_DENIED,
 		BAD_SERIALNUMBER,
 		SERIALNUMBER_UNPRINTABLE,
 		MODEL_UNPRINTABLE,
@@ -171,6 +172,7 @@ protected:
 
 	DISK_RESULT			addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify);
 	DISK_RESULT			getDeviceData(HANDLE hIoCtrl, std::size_t physicalDriveId, INTERFACE_TYPE interfaceType);
+	const std::wstring  getStringDiskResult(DISK_RESULT eResult) const;
 
 	bool				containsNonPrintableChars(const char *str, std::size_t length) const;
 	bool				doIdentifyDevicePd(HANDLE hIoCtrl, std::size_t physicalDriveId, std::uint8_t target, IDENTIFY_DEVICE &data);
@@ -192,7 +194,7 @@ protected:
 	bool		checkOSVersion();
 	bool		isWindows10OrGreater() const;
 	bool		isWindows8OrGreater() const;
-	std::size_t	getSystemBootDriveNumber();
+	std::size_t	getSystemBootDriveNumber() const;
 
 	enum IO_CONTROL_CODE : DWORD
 	{
@@ -221,6 +223,7 @@ protected:
 		bool				BootFromDisk = false;
 	};
 	using DiskIter = std::vector<ATA_SMART_INFO>::iterator;
+	ATA_SMART_INFO *findDeviceInfo(std::size_t physicalDriveId);
 
 	template <typename T>
 	bool	copyDeviceInfo(ATA_SMART_INFO &asi, const T &deviceInfo);
@@ -256,6 +259,7 @@ void CIDFinder::init()
 #if USE_WMI
 	queryDevicesUsingWMI(); // if any chance WMI then use it
 #endif
+
 	queryDevicesUsingIOCTL();
 }
 
@@ -372,7 +376,7 @@ void CIDFinder::queryDevicesUsingWMI()
 		CComPtr<IEnumWbemClassObject> pEnumerator = NULL;
 		hr = pSvc->ExecQuery(bstr_t("WQL"), bstr_t(
 			isWindows8OrGreater() ?
-			"SELECT Number,Model,FirmwareVersion,SerialNumber,BootFromDisk,BusType FROM MSFT_Disk" :
+			"SELECT Number,Model,FirmwareVersion,SerialNumber,BootFromDisk,Path,BusType FROM MSFT_Disk" :
 			"SELECT Index,Model,FirmwareRevision,PNPDeviceID,SerialNumber FROM Win32_DiskDrive WHERE MediaType='Fixed hard disk media'"),
 			WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator
 		);
@@ -398,81 +402,87 @@ void CIDFinder::queryDevicesUsingWMI()
 
 			_variant_t vtIndex{};
 			hr = pclsObj->Get(isWindows8OrGreater() ? L"Number" : L"Index", 0, &vtIndex, NULL, NULL);
-			if (FAILED(hr)) {
+			if (FAILED(hr) || vtIndex.vt <= VT_NULL) {
 				log << "  WMI [Warning]       Could not retrieve column '" << (isWindows8OrGreater() ? "Number" : "Index") << "'" << endl;
 				continue;
 			}
 
 			bool BootFromDisk = false;
-			INTERFACE_TYPE interfaceType = INTERFACE_TYPE::SATA; // assume that there is a SATA/PATA drive
+			INTERFACE_TYPE interfaceType = INTERFACE_TYPE::UNKNOWN; // assume that there is a SATA/PATA drive
 			if (isWindows8OrGreater())
 			{
 				_variant_t vtBusType{};
 				hr = pclsObj->Get(L"BusType", 0, &vtBusType, NULL, NULL);
-				if (FAILED(hr)) {
+				if (FAILED(hr) || vtBusType.vt <= VT_NULL) {
 					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'BusType'" << endl;
 					continue;
 				}
 
-				switch (vtBusType.cVal)
+				switch (vtBusType.uintVal)
 				{
+				case BusTypeRAID:
 				case BusTypeNvme: interfaceType = INTERFACE_TYPE::NVME; break;
 				case BusTypeSata: interfaceType = INTERFACE_TYPE::SATA; break;
 				case BusTypeAta:  interfaceType = INTERFACE_TYPE::PATA; break;
 				default:
-					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Undesirable interface '" << vtBusType.cVal << "' Skipping..." << endl;
+					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Undesirable interface '" << vtBusType.uintVal << "' Skipping..." << endl;
 					continue; // bad interface
 				}
 
 				_variant_t vtBootFromDisk{};
 				hr = pclsObj->Get(L"BootFromDisk", 0, &vtBootFromDisk, NULL, NULL);
-				if (FAILED(hr)) {
+				if (FAILED(hr) || vtBootFromDisk.vt <= VT_NULL) {
 					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'BootFromDisk'" << endl;
 					continue;
 				}
 				BootFromDisk = vtBootFromDisk.boolVal != 0;
 			}
-			// Workaround detecting NVME for earlier than 8
-			else
+
+			if (interfaceType == INTERFACE_TYPE::UNKNOWN)
 			{
 				_variant_t vtPNPDeviceID{};
-				hr = pclsObj->Get(L"PNPDeviceID", 0, &vtPNPDeviceID, NULL, NULL);
-				if (FAILED(hr) || !vtPNPDeviceID.bstrVal) {
+				hr = pclsObj->Get(isWindows8OrGreater() ? L"Path" : L"PNPDeviceID", 0, &vtPNPDeviceID, NULL, NULL);
+				if (FAILED(hr) || vtPNPDeviceID.vt <= VT_NULL || !vtPNPDeviceID.bstrVal) {
 					log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'PNPDeviceID'" << endl;
 					continue;
 				}
 
-				if (wcsstr(vtPNPDeviceID.bstrVal, L"NVME")) {
+				std::wstring wPNPDeviceID(vtPNPDeviceID.bstrVal);
+				if (StrUtil::find(wPNPDeviceID, L"NVME") != std::wstring::npos || StrUtil::find(wPNPDeviceID, L"OPTANE") != std::wstring::npos) {
+					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Hard drive bus type 'NVME' detected by the 'PNPDeviceID' property '" << wPNPDeviceID << "'" << endl;
 					interfaceType = INTERFACE_TYPE::NVME;
-					log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Hard drive bus type 'NVME' detected by the 'PNPDeviceID' property (" << vtPNPDeviceID.bstrVal << ")" << endl;
 				}
-			}
-
-			_variant_t vtFirmwareVersion{};
-			hr = pclsObj->Get(isWindows8OrGreater() ? L"FirmwareVersion" : L"FirmwareRevision", 0, &vtFirmwareVersion, NULL, NULL);
-			if (FAILED(hr) || !vtFirmwareVersion.bstrVal) {
-				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column '" << (isWindows8OrGreater() ? "FirmwareVersion" : "FirmwareRevision") << "'" << endl;
-				continue;
 			}
 
 			_variant_t vtModel{};
 			hr = pclsObj->Get(L"Model", 0, &vtModel, NULL, NULL);
-			if (FAILED(hr) || !vtModel.bstrVal) {
+			if (FAILED(hr) || vtModel.vt <= VT_NULL || !vtModel.bstrVal) {
 				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'Model'" << endl;
 				continue;
 			}
 
 			std::wstring wModel(vtModel.bstrVal);
+			if (interfaceType != INTERFACE_TYPE::NVME && (StrUtil::find(wModel, L"NVME") != std::wstring::npos || StrUtil::find(wModel, L"OPTANE") != std::wstring::npos)) {
+				log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Hard drive bus type 'NVME' detected by the 'Model' property (" << wModel << ")" << endl;
+				interfaceType = INTERFACE_TYPE::NVME;
+			}
 
 			// Workaround for FuzeDrive (AMDStoreMi)
-			if (wModel.find(L"FuzeDrive") != std::string::npos || wModel.find(L"StoreMI") != std::string::npos) {
+			if (StrUtil::find(wModel, L"FuzeDrive") != std::wstring::npos || StrUtil::find(wModel, L"StoreMI") != std::wstring::npos) {
 				log << "  WMI [Info/Disk" << vtIndex.uintVal << "]    Undesirable model '" << wModel << "' Skipping..." << endl;
+				continue;
+			}
+
+			_variant_t vtFirmwareVersion{};
+			hr = pclsObj->Get(isWindows8OrGreater() ? L"FirmwareVersion" : L"FirmwareRevision", 0, &vtFirmwareVersion, NULL, NULL);
+			if (FAILED(hr) || vtFirmwareVersion.vt <= VT_NULL || !vtFirmwareVersion.bstrVal) {
+				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column '" << (isWindows8OrGreater() ? "FirmwareVersion" : "FirmwareRevision") << "'" << endl;
 				continue;
 			}
 
 			_variant_t vtSerialNumber{};
 			hr = pclsObj->Get(L"SerialNumber", 0, &vtSerialNumber, NULL, NULL);
-			if (FAILED(hr) || !vtSerialNumber.bstrVal) {
+			if (FAILED(hr) || vtSerialNumber.vt <= VT_NULL || !vtSerialNumber.bstrVal) {
 				log << "  WMI [Warning/Disk" << vtIndex.uintVal << "] Could not retrieve column 'SerialNumber'" << endl;
 				continue;
 			}
@@ -545,6 +555,22 @@ void CIDFinder::queryDevicesUsingWMI()
 }
 #endif
 
+const std::wstring CIDFinder::getStringDiskResult(DISK_RESULT eResult) const
+{
+	switch (eResult)
+	{
+	default:
+	case DISK_RESULT::UNKNOWN:                  return L" (Unknown)";                   break;
+	case DISK_RESULT::BAD_SERIALNUMBER:         return L" (Bad serial number)";         break;
+	case DISK_RESULT::SERIALNUMBER_UNPRINTABLE: return L" (Unprintable serial number)"; break;
+	case DISK_RESULT::MODEL_UNPRINTABLE:        return L" (Unprintable model)";         break;
+	case DISK_RESULT::FIRMWARE_UNPRINTABLE:     return L" (Unprintable firmware)";      break;
+	case DISK_RESULT::LIMIT_REACHED:            return L" (Limit reached)";             break;
+	}
+
+	return L"";
+}
+
 typedef struct _VOLUME_DISK_EXTENTS_LX
 {
 	DWORD       NumberOfDiskExtents;
@@ -553,18 +579,17 @@ typedef struct _VOLUME_DISK_EXTENTS_LX
 
 void CIDFinder::queryDevicesUsingIOCTL()
 {
-	DWORD driveLetterMap[256]{0};
-
-	// Scan physical drives
+	// Scan drives
 	for (std::size_t i = 0; i < MAX_SEARCH_PHYSICAL_DRIVE; i++)
 	{
 		bool bElevatedPermissions = true;
-		std::wstring strDevice = L"\\\\.\\PhysicalDrive" + std::to_wstring(i);
-		HANDLE hDevice = openPhysicalDrive(strDevice.c_str(), &bElevatedPermissions);
+		std::wstring pathDevice = L"\\\\.\\PhysicalDrive" + std::to_wstring(i);
+		HANDLE hDevice = openPhysicalDrive(pathDevice.c_str(), &bElevatedPermissions);
 		if (!HANDLE_SUCCESS(hDevice))
 		{
-			if (GetLastError() == ERROR_ACCESS_DENIED) {
-				log << "IOCTL [Info/Disk" << i << "]    No access" << endl;
+			int iError = GetLastError();
+			if (iError == ERROR_ACCESS_DENIED) {
+				log << "IOCTL [Info/Disk" << i << "]    No access (No permissions?)" << endl;
 			}
 
 			continue;
@@ -628,6 +653,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 
 		const STORAGE_DEVICE_DESCRIPTOR *pDescriptor = (STORAGE_DEVICE_DESCRIPTOR *)outBuffer.get();
 		switch (pDescriptor->BusType) {
+		case BusTypeRAID: // RAID mode supports only for NVMe
 		case BusTypeNvme: interfaceType = INTERFACE_TYPE::NVME; break;
 		case BusTypeSata: interfaceType = INTERFACE_TYPE::SATA; break;
 		case BusTypeAta:  interfaceType = INTERFACE_TYPE::PATA; break;
@@ -644,7 +670,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		}
 
 		// Workaround for FuzeDrive (AMDStoreMi)
-		if (model.find("FuzeDrive") != std::string::npos || model.find("StoreMI") != std::string::npos) {
+		if (StrUtil::find(model, "FuzeDrive") != std::string::npos || StrUtil::find(model, "StoreMI") != std::string::npos) {
 			CloseHandle(hDevice);
 			log << "IOCTL [Info/Disk" << i << "]    Undesirable model '" << StrUtil::s2ws(model) << "' Skipping..." << endl;
 			continue;
@@ -654,12 +680,12 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		if (eResult == DISK_RESULT::OK)
 		{
 			ATA_SMART_INFO &asi = disks.back();
-			if (   asi.Model.find("DW C") != std::string::npos // WDC
-				|| asi.Model.find("iHat") != std::string::npos // Hitachi
-				|| asi.Model.find("ASSM") != std::string::npos // SAMSUNG
-				|| asi.Model.find("aMtx") != std::string::npos // Maxtor
-				|| asi.Model.find("OTHS") != std::string::npos // TOSHIBA
-				|| asi.Model.find("UFIJ") != std::string::npos // FUJITSU
+			if (   StrUtil::find(asi.Model, "DW C") != std::string::npos // WDC
+				|| StrUtil::find(asi.Model, "iHat") != std::string::npos // Hitachi
+				|| StrUtil::find(asi.Model, "ASSM") != std::string::npos // SAMSUNG
+				|| StrUtil::find(asi.Model, "aMtx") != std::string::npos // Maxtor
+				|| StrUtil::find(asi.Model, "OTHS") != std::string::npos // TOSHIBA
+				|| StrUtil::find(asi.Model, "UFIJ") != std::string::npos // FUJITSU
 				)
 			{
 				StrUtil::change_byte_order(asi.SerialNumber);
@@ -673,7 +699,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 		}
 		// If there are no elevated permissions, just try add disk from storage device descriptor,
 		// but it incorrectly indicates the serialNumber for NVME
-		else if (!bElevatedPermissions)
+		else if (!bElevatedPermissions || eResult == DISK_RESULT::ACCESS_DENIED)
 		{
 			IDENTIFY_DEVICE identify{};
 			switch (interfaceType)
@@ -697,22 +723,23 @@ void CIDFinder::queryDevicesUsingIOCTL()
 	}
 
 #if USE_DEBUG
+	DWORD driveLetterMap[256]{0};
 	// Drive Letter Mapping http://www.cplusplus.com/forum/windows/12196/
 	for (char c = 'A'; c <= 'Z'; c++)
 	{
-		std::wstring drive_path = L"";
-		drive_path += c;
-		drive_path += L":\\";
+		std::wstring volumePath = L"";
+		volumePath += c;
+		volumePath += L":\\";
 
-		std::size_t driver_type = GetDriveTypeW(drive_path.c_str());
-		if (driver_type != DRIVE_FIXED)
+		std::size_t driveType = GetDriveTypeW(volumePath.c_str());
+		if (driveType != DRIVE_FIXED)
 			continue;
 
-		std::wstring path = L"\\\\.\\";
-		path += c;
-		path += L":";
+		std::wstring drivePath = L"\\\\.\\";
+		drivePath += c;
+		drivePath += L":";
 
-		HANDLE hHandle = openPhysicalDrive(path.c_str());
+		HANDLE hHandle = openPhysicalDrive(drivePath.c_str());
 		if (!HANDLE_SUCCESS(hHandle))
 			continue;
 
@@ -821,7 +848,6 @@ HANDLE CIDFinder::openPhysicalDrive(const std::wstring &path, bool *pbElevatedPe
 	HANDLE hIoCtrl = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, // NOTE: requeriment elevated permissions
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 
-#if 1
 	if (!HANDLE_SUCCESS(hIoCtrl))
 	{
 		// try open again but without permissions
@@ -829,7 +855,6 @@ HANDLE CIDFinder::openPhysicalDrive(const std::wstring &path, bool *pbElevatedPe
 		hIoCtrl = CreateFileW(path.c_str(), 0,
 			FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	}
-#endif
 
 	if (pbElevatedPermissions)
 		*pbElevatedPermissions = bElevatedPermissions;
@@ -1092,7 +1117,10 @@ bool CIDFinder::doIdentifyDeviceNVMeIntelRst(HANDLE hIoCtrl, std::size_t physica
 		return false;
 	}
 
-	std::wstring strScsiDrive = L"\\\\.\\Scsi%d:" + std::to_wstring(portNumber);
+	std::wstring strScsiDrive = L"\\\\.\\Scsi";
+	strScsiDrive += std::to_wstring(portNumber);
+	strScsiDrive += L":";
+
 	HANDLE hIoScsiCtrl = CreateFileW(strScsiDrive.c_str(), GENERIC_READ | GENERIC_WRITE, // TODO: REQUERIMENT ADMIN RIGHTS
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	if (!HANDLE_SUCCESS(hIoScsiCtrl)) {
@@ -1145,7 +1173,10 @@ bool CIDFinder::doIdentifyDeviceNVMeIntelVroc(HANDLE hIoCtrl, std::size_t physic
 		return false;
 	}
 
-	std::wstring strScsiDrive = L"\\\\.\\Scsi%d:" + std::to_wstring(portNumber);
+	std::wstring strScsiDrive = L"\\\\.\\Scsi";
+	strScsiDrive += std::to_wstring(portNumber);
+	strScsiDrive += L":";
+
 	HANDLE hIoScsiCtrl = CreateFileW(strScsiDrive.c_str(), GENERIC_READ | GENERIC_WRITE, // TODO: REQUERIMENT ADMIN RIGHTS
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (!HANDLE_SUCCESS(hIoScsiCtrl))
@@ -1268,7 +1299,7 @@ bool CIDFinder::copyDeviceInfoFromStorage(ATA_SMART_INFO &asi, const STORAGE_DEV
 	asi.SerialNumber = StrUtil::trim(asi.SerialNumber);
 
 	// bad serialNumber
-	if (asi.SerialNumber.find("0000_0000_0000_") != std::string::npos)
+	if (StrUtil::find(asi.SerialNumber, "0000_0000_0000_") != std::string::npos)
 		return false;
 
 	return true;
@@ -1307,21 +1338,18 @@ bool CIDFinder::copyDeviceInfo(ATA_SMART_INFO &asi, const T &deviceInfo)
 	return true;
 }
 
-enum class BADDISK_REASON
+CIDFinder::ATA_SMART_INFO *CIDFinder::findDeviceInfo(std::size_t physicalDriveId)
 {
-	OK = 0,
-	UKNOWN,
-	SERIALNUMBER,
-	SERIALNUMBER_UNPRINTABLE,
-	MODEL_UNPRINTABLE,
-	FIRMWARE_UNPRINTABLE,
-	LIMIT_REACHED,
-};
+	DiskIter &it = std::find_if(disks.begin(), disks.end(), [&](const ATA_SMART_INFO &info) {
+		return info.PhysicalDriveId == physicalDriveId;
+	});
+	return (it == disks.end()) ? nullptr : &(*it);
+}
 
 CIDFinder::DISK_RESULT CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE_TYPE interfaceType, COMMAND_TYPE command, DEVICE_DATA_SOURCE source, const IDENTIFY_DEVICE &identify)
 {
 	if (command == COMMAND_TYPE::UNKNOWN)
-		return DISK_RESULT::UNKNOWN;
+		return DISK_RESULT::ACCESS_DENIED;
 
 	ATA_SMART_INFO asi{};
 	asi.IdentifyDevice      = identify;
@@ -1360,26 +1388,22 @@ CIDFinder::DISK_RESULT CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE
 //		return false;
 
 	// Check overlap
-	DiskIter &it = std::find_if(disks.begin(), disks.end(), [&](ATA_SMART_INFO &info) {
-		return info.PhysicalDriveId == physicalDriveId;
-	});
-
-	if (it != disks.end())
+	ATA_SMART_INFO *device = findDeviceInfo(physicalDriveId);
+	if (device)
 	{
 		// update device info
-		ATA_SMART_INFO &device = (*it);
-		device.IdentifyDevice  = asi.IdentifyDevice;
-		device.InterfaceType   = asi.InterfaceType;
-		device.CommandType     = asi.CommandType;
-		device.DataSource      = asi.DataSource;
-		device.PhysicalDriveId = asi.PhysicalDriveId;
-		device.DriveLetterMap  = asi.DriveLetterMap;
-		device.DriveMap        = asi.DriveMap;
-		device.Model           = asi.Model;
-		device.SerialNumber    = asi.SerialNumber;
-		device.FirmwareRev     = asi.FirmwareRev;
-		if (!device.BootFromDisk)
-			device.BootFromDisk = asi.BootFromDisk;
+		device->IdentifyDevice  = asi.IdentifyDevice;
+		device->InterfaceType   = asi.InterfaceType;
+		device->CommandType     = asi.CommandType;
+		device->DataSource      = asi.DataSource;
+		device->PhysicalDriveId = asi.PhysicalDriveId;
+		device->DriveLetterMap  = asi.DriveLetterMap;
+		device->DriveMap        = asi.DriveMap;
+		device->Model           = asi.Model;
+		device->SerialNumber    = asi.SerialNumber;
+		device->FirmwareRev     = asi.FirmwareRev;
+		if (!device->BootFromDisk)
+			device->BootFromDisk = asi.BootFromDisk;
 	}
 	else
 	{
@@ -1392,7 +1416,7 @@ CIDFinder::DISK_RESULT CIDFinder::addDisk(std::size_t physicalDriveId, INTERFACE
 	return DISK_RESULT::OK;
 }
 
-std::size_t CIDFinder::getSystemBootDriveNumber()
+std::size_t CIDFinder::getSystemBootDriveNumber() const
 {
 	static std::size_t system_boot_on_driveid = -1;
 	if (system_boot_on_driveid != -1)
@@ -1425,7 +1449,7 @@ std::string CIDFinder::getSerialNumber() const
 {
 	for (const ATA_SMART_INFO &asi : disks) {
 		if (asi.SerialNumber.empty()) continue;
-		std::cout << "      [Info/Disk" << asi.PhysicalDriveId << "]          Preferred SerialNumber is selected '" << asi.SerialNumber << "'" << endl;
+		std::cout << "      [Info/Disk" << asi.PhysicalDriveId << "]    Preferred SerialNumber is selected '" << asi.SerialNumber << "'" << endl;
 		return asi.SerialNumber;
 	}
 
