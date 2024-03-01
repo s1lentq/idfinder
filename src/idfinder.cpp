@@ -710,7 +710,7 @@ void CIDFinder::queryDevicesUsingIOCTL()
 				break;
 			case INTERFACE_TYPE::SATA:
 			case INTERFACE_TYPE::PATA:
-				memcpy_s(&identify, sizeof(ATA_IDENTIFY_DEVICE), outBuffer.get(), sizeof(ATA_IDENTIFY_DEVICE));
+				memcpy(&identify, outBuffer.get(), min(dwOutBufferSize, sizeof(ATA_IDENTIFY_DEVICE)));
 				addDisk(i, interfaceType, COMMAND_TYPE::PHYSICAL_DRIVE, DEVICE_DATA_SOURCE::STORAGE_DESCRIPTOR, identify);
 				break;
 			default:
